@@ -2,8 +2,8 @@ import csv
 import os
 from flask import Flask, flash, jsonify, render_template, request, redirect, session, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
-import mysql.connector
 from decimal import Decimal
+import mysql.connector
 
 # Configuración de la app Flask
 app = Flask(__name__, template_folder='templates', static_folder='static')
@@ -599,8 +599,9 @@ def logout():
 
 # --------------------------- INICIO APP ---------------------------
 
-if __name__ == '__main__':
-    app.run(debug=True)
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
 
 
 
