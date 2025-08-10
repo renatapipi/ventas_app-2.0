@@ -1,21 +1,26 @@
-import csv
 import os
 from flask import Flask, flash, jsonify, render_template, request, redirect, session, url_for
 from werkzeug.security import generate_password_hash, check_password_hash
 from decimal import Decimal
-import mysql.connector
+import psycopg2  # Cambiamos mysql.connector por psycopg2
+from psycopg2 import sql
+from dotenv import load_dotenv
+from flask import jsonify
+# Cargar variables de entorno
+load_dotenv()
 
 # Configuración de la app Flask
 app = Flask(__name__, template_folder='templates', static_folder='static')
-app.secret_key = 'clave_super_secreta'
+app.secret_key = os.getenv('SECRET_KEY')
 
-# Función para conectar a la base de datos
+# Función para conectar a PostgreSQL
 def conectar():
-    return mysql.connector.connect(
-        host="localhost",
-        user="root",
-        password="renata82",
-        database="ventas_cintia"
+    return psycopg2.connect(
+        host=os.getenv('DB_HOST'),
+        user=os.getenv('DB_USER'),
+        password=os.getenv('DB_PASSWORD'),
+        database=os.getenv('DB_NAME'),
+        port=os.getenv('DB_PORT', '5432')
     )
 
 # Decorador para verificar acceso de administrador
@@ -30,15 +35,9 @@ def requiere_admin(f):
 
 # --------------------------- AUTENTICACIÓN ---------------------------
 
-from werkzeug.security import check_password_hash
-
 @app.route('/', methods=['GET', 'POST'])
 def login():
     error = ''
-
-    if not os.path.exists('usuarios.csv'):
-        with open('usuarios.csv', 'w', newline='') as f:
-            f.write('admin,1234,admin\n')
 
     if request.method == 'POST':
         user = request.form.get('username')
@@ -47,16 +46,28 @@ def login():
         if not user or not password:
             error = 'Debe ingresar usuario y contraseña'
         else:
-            with open('usuarios.csv', newline='') as f:
-                reader = csv.reader(f)
-                for fila in reader:
-                    if len(fila) == 3:
-                        u, p, rol = fila
-                        if u == user and p == password:
-                            session['usuario'] = u
-                            session['rol'] = rol
-                            return redirect(url_for('menu'))
-            error = 'Usuario o contraseña incorrectos'
+            conn = conectar()
+            cursor = conn.cursor()
+            try:
+                cursor.execute(
+                    "SELECT usuario, password, rol FROM usuarios WHERE usuario = %s",
+                    (user,)
+                )
+                usuario_data = cursor.fetchone()
+                
+                if usuario_data:
+                    usuario, hashed_password, rol = usuario_data
+                    if check_password_hash(hashed_password, password):
+                        session['usuario'] = usuario
+                        session['rol'] = rol
+                        return redirect(url_for('menu'))
+                
+                error = 'Usuario o contraseña incorrectos'
+            except Exception as e:
+                error = f'Error al autenticar: {str(e)}'
+            finally:
+                cursor.close()
+                conn.close()
 
     return render_template('login.html', error=error)
 
@@ -100,7 +111,7 @@ def crear_usuario():
         )
         conn.commit()
         flash('Usuario creado exitosamente', 'success')
-    except mysql.connector.Error as err:
+    except Exception as err:  # Cambiamos mysql.connector.Error por Exception genérico
         conn.rollback()
         flash(f'Error al crear usuario: {err}', 'error')
     finally:
@@ -132,9 +143,12 @@ def editar_usuario(id):
             )
         conn.commit()
         flash('Usuario actualizado exitosamente', 'success')
-    except mysql.connector.Error as err:
+    except psycopg2.Error as err:  # Cambio clave aquí
         conn.rollback()
-        flash(f'Error al actualizar usuario: {err}', 'error')
+        flash(f'Error al actualizar usuario: {err.pgerror}', 'error')
+    except Exception as err:  # Para otros errores inesperados
+        conn.rollback()
+        flash(f'Error inesperado: {str(err)}', 'error')
     finally:
         cursor.close()
         conn.close()
@@ -144,18 +158,24 @@ def editar_usuario(id):
 @app.route('/usuarios/eliminar/<int:id>')
 @requiere_admin
 def eliminar_usuario(id):
-    conn = conectar()
-    cursor = conn.cursor()
     try:
-        cursor.execute("DELETE FROM usuarios WHERE id = %s", (id,))
-        conn.commit()
-        flash('Usuario eliminado exitosamente', 'success')
-    except mysql.connector.Error as err:
-        conn.rollback()
-        flash(f'Error al eliminar usuario: {err}', 'error')
-    finally:
-        cursor.close()
-        conn.close()
+        with conectar() as conn:  # Usamos el context manager para la conexión
+            with conn.cursor() as cursor:  # Context manager para el cursor
+                # Verificamos si el usuario existe primero
+                cursor.execute("SELECT 1 FROM usuarios WHERE id = %s", (id,))
+                if not cursor.fetchone():
+                    flash('El usuario no existe', 'error')
+                    return redirect(url_for('listar_usuarios'))
+                
+                # Eliminamos el usuario
+                cursor.execute("DELETE FROM usuarios WHERE id = %s", (id,))
+                conn.commit()
+                flash('Usuario eliminado exitosamente', 'success')
+                
+    except psycopg2.Error as err:  # Excepción específica de PostgreSQL
+        flash(f'Error al eliminar usuario: {err.pgerror}', 'error')
+    except Exception as err:  # Para otros errores inesperados
+        flash(f'Error inesperado: {str(err)}', 'error')
     
     return redirect(url_for('listar_usuarios'))
 
@@ -169,6 +189,9 @@ def productos():
     mensaje = ''
     editar_id = request.args.get('editar')
 
+    conn = conectar()
+    cursor = conn.cursor()
+
     if request.method == 'POST':
         nombre = request.form['nombre']
         costo = float(request.form['costo'])
@@ -177,26 +200,28 @@ def productos():
         marca = request.form.get('marca', '')
         rubro = request.form.get('rubro', '')
 
-        conn = conectar()
-        cursor = conn.cursor()
-        if editar_id:
-            producto_id = int(editar_id)
-            cursor.execute("""
-                UPDATE productos SET nombre=%s, costo=%s, precio=%s, stock=%s, marca=%s, rubro=%s WHERE id=%s
-            """, (nombre, costo, precio, stock, marca, rubro, producto_id))
-            mensaje = "Producto actualizado con éxito."
-        else:
-            cursor.execute("""
-                INSERT INTO productos (nombre, costo, precio, stock, marca, rubro)
-                VALUES (%s, %s, %s, %s, %s, %s)
-            """, (nombre, costo, precio, stock, marca, rubro))
-            mensaje = f'¡Producto registrado con éxito! Precio de venta: ${precio:.2f}'
-        conn.commit()
-        conn.close()
-
-    conn = conectar()
-    cursor = conn.cursor(dictionary=True)
-    cursor.execute("SELECT * FROM productos")
+        try:
+            if editar_id:
+                cursor.execute(
+                    """UPDATE productos SET nombre=%s, costo=%s, precio=%s, 
+                    stock=%s, marca=%s, rubro=%s WHERE id=%s""",
+                    (nombre, costo, precio, stock, marca, rubro, editar_id)
+                )
+                mensaje = "Producto actualizado con éxito."
+            else:
+                cursor.execute(
+                    """INSERT INTO productos (nombre, costo, precio, stock, marca, rubro)
+                    VALUES (%s, %s, %s, %s, %s, %s) RETURNING id""",
+                    (nombre, costo, precio, stock, marca, rubro)
+                )
+                mensaje = f'¡Producto registrado con éxito! Precio de venta: ${precio:.2f}'
+            conn.commit()
+        except Exception as e:
+            conn.rollback()
+            mensaje = f'Error: {str(e)}'
+        
+    # Obtener productos
+    cursor.execute("SELECT * FROM productos ORDER BY id")
     productos = cursor.fetchall()
 
     producto_a_editar = None
@@ -207,7 +232,10 @@ def productos():
     cursor.close()
     conn.close()
 
-    return render_template('productos.html', productos=productos, mensaje=mensaje, producto=producto_a_editar)
+    return render_template('productos.html', 
+                         productos=productos, 
+                         mensaje=mensaje, 
+                         producto=producto_a_editar)
 
 # --------------------------- VENTAS ---------------------------
 
@@ -340,163 +368,157 @@ def venta():
     if 'usuario' not in session:
         return redirect('/')
 
-    conn = conectar()
-    cursor = conn.cursor(dictionary=True)
-    mensaje = None
-    venta_exitosa = False
-    datos_venta = None
+    try:
+        with conectar() as conn:
+            with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cursor:
+                # Obtener productos con stock
+                cursor.execute("SELECT * FROM productos WHERE stock > 0")
+                productos = cursor.fetchall()
 
-    # Obtener productos con stock para el formulario
-    cursor.execute("SELECT * FROM productos WHERE stock > 0")
-    productos = cursor.fetchall()
+                # Obtener clientes
+                cursor.execute("SELECT * FROM clientes ORDER BY nombre")
+                clientes = cursor.fetchall()
 
-    # Obtener lista completa de clientes
-    cursor.execute("SELECT * FROM clientes ORDER BY nombre")
-    clientes = cursor.fetchall()
+                # Paginación
+                pagina = request.args.get('page', 1, type=int)
+                por_pagina = 10
+                offset = (pagina - 1) * por_pagina
 
-    # -------------------------------
-    # PAGINACIÓN DE ÚLTIMAS VENTAS
-    # -------------------------------
-    pagina = request.args.get('page', 1, type=int)
-    por_pagina = 10
-    offset = (pagina - 1) * por_pagina
+                cursor.execute("SELECT COUNT(*) AS total FROM ventas")
+                total_ventas = cursor.fetchone()['total']
 
-    # Total de ventas
-    cursor.execute("SELECT COUNT(*) AS total FROM ventas")
-    total_ventas = cursor.fetchone()['total']
+                cursor.execute("""
+                    SELECT p.nombre AS producto, v.cantidad, v.cliente, v.forma_pago,
+                           v.usuario AS vendedor, v.ganancia, v.total, v.fecha
+                    FROM ventas v
+                    JOIN productos p ON v.producto_id = p.id
+                    ORDER BY v.fecha DESC
+                    LIMIT %s OFFSET %s
+                """, (por_pagina, offset))
+                ventas = cursor.fetchall()
 
-    # Consulta con límite y desplazamiento
-    cursor.execute("""
-        SELECT p.nombre AS producto, v.cantidad, v.cliente, v.forma_pago,
-               v.usuario AS vendedor, v.ganancia, v.total, v.fecha
-        FROM ventas v
-        JOIN productos p ON v.producto_id = p.id
-        ORDER BY v.fecha DESC
-        LIMIT %s OFFSET %s
-    """, (por_pagina, offset))
-    ventas = cursor.fetchall()
+                total_paginas = (total_ventas + por_pagina - 1) // por_pagina
 
-    total_paginas = (total_ventas + por_pagina - 1) // por_pagina
+                # Lógica para POST
+                if request.method == 'POST':
+                    return handle_venta_post(conn, cursor, session['usuario'], productos)
 
-    # -------------------------------
-    # LÓGICA DE REGISTRO DE VENTA
-    # -------------------------------
-    if request.method == 'POST':
-        producto_id = request.form.get('producto')
-        cantidad = request.form.get('cantidad')
-        forma_pago = request.form.get('forma_pago')
-        cliente = request.form.get('cliente', 'Consumidor Final')
-        descuento = float(request.form.get('descuento', 0)) or 0
-
-        # Validaciones básicas
-        if not producto_id:
-            mensaje = "Debe seleccionar un producto"
-        elif not cantidad or int(cantidad) <= 0:
-            mensaje = "La cantidad debe ser mayor a cero"
-        else:
-            cantidad = int(cantidad)
-            
-            # Validación para cuentas corrientes
-            if forma_pago.lower() == 'cuentas corrientes':
-                if not cliente or cliente == 'Consumidor Final':
-                    mensaje = "Debe seleccionar un cliente registrado para ventas a cuentas corrientes"
-                else:
-                    cursor.execute("SELECT id FROM clientes WHERE nombre = %s", (cliente,))
-                    if not cursor.fetchone():
-                        mensaje = "El cliente no existe en la base de datos"
-
-            if not mensaje:
-                cursor.execute("SELECT * FROM productos WHERE id = %s", (producto_id,))
-                producto = cursor.fetchone()
-
-                if not producto:
-                    mensaje = "Producto no encontrado."
-                elif cantidad > producto['stock']:
-                    mensaje = f"No hay stock suficiente. Stock actual: {producto['stock']}"
-                else:
-                    precio_venta = float(producto['precio'])
-                    costo = float(producto['costo'])
-                    ganancia_unitaria = precio_venta - costo
-                    subtotal = precio_venta * cantidad
-                    total = subtotal - descuento
-
-                    if total < 0:
-                        mensaje = "El descuento no puede ser mayor que el total."
-                    else:
-                        saldo_pendiente = total if forma_pago.lower() == 'cuentas corrientes' else 0
-
-                        try:
-                            cursor.execute("""
-                                INSERT INTO ventas 
-                                (producto_id, cantidad, usuario, ganancia, fecha, total, 
-                                 forma_pago, cliente, descuento, saldo_pendiente)
-                                VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
-                            """, (
-                                producto_id, cantidad, session['usuario'], ganancia_unitaria, 
-                                total, forma_pago, cliente, descuento, saldo_pendiente
-                            ))
-
-                            venta_id = cursor.lastrowid
-
-                            nuevo_stock = producto['stock'] - cantidad
-                            cursor.execute("""
-                                UPDATE productos SET stock = %s WHERE id = %s
-                            """, (nuevo_stock, producto_id))
-
-                            if forma_pago.lower() == 'cuentas corrientes':
-                                cursor.execute("""
-                                    INSERT INTO deudas_clientes 
-                                    (cliente, venta_id, monto_original, saldo_pendiente, fecha)
-                                    VALUES (%s, %s, %s, %s, NOW())
-                                    ON DUPLICATE KEY UPDATE 
-                                    saldo_pendiente = VALUES(saldo_pendiente)
-                                """, (cliente, venta_id, total, total))
-
-                            conn.commit()
-                            venta_exitosa = True
-                            datos_venta = {
-                                'success': True,
-                                'message': "Venta registrada correctamente",
-                                'total': f"{total:.2f}",
-                                'forma_pago': forma_pago,
-                                'producto': producto['nombre'],
-                                'cantidad': cantidad,
-                                'venta_id': venta_id,
-                                'saldo_pendiente': f"{saldo_pendiente:.2f}" if saldo_pendiente > 0 else None,
-                                'es_cuenta_corriente': forma_pago.lower() == 'cuentas corrientes',
-                                'stock_actualizado': nuevo_stock
-                            }
-
-                            cursor.execute("SELECT * FROM productos WHERE stock > 0")
-                            productos = cursor.fetchall()
-
-                        except mysql.connector.Error as err:
-                            conn.rollback()
-                            datos_venta = {
-                                'success': False,
-                                'message': f"Error al registrar la venta: {err}"
-                            }
-
-    cursor.close()
-    conn.close()
-
-    if request.method == 'POST' and request.headers.get('X-Requested-With') == 'XMLHttpRequest':
-        return jsonify(datos_venta if datos_venta else {
-            'success': False,
-            'message': mensaje or 'Error desconocido'
-        })
+    except psycopg2.Error as err:
+        flash(f'Error de base de datos: {err.pgerror}', 'error')
+        return redirect(url_for('venta'))
 
     return render_template(
         'venta.html',
         productos=productos,
-        mensaje=mensaje,
         clientes=clientes,
-        venta_exitosa=venta_exitosa,
-        venta_data=datos_venta,
         ventas=ventas,
         pagina=pagina,
         total_paginas=total_paginas
     )
+
+def handle_venta_post(conn, cursor, usuario, productos):
+    producto_id = request.form.get('producto')
+    cantidad = request.form.get('cantidad')
+    forma_pago = request.form.get('forma_pago')
+    cliente = request.form.get('cliente', 'Consumidor Final')
+    descuento = float(request.form.get('descuento', 0)) or 0
+
+    # Validaciones
+    if not producto_id:
+        return jsonify({'success': False, 'message': "Debe seleccionar un producto"})
+    
+    if not cantidad or int(cantidad) <= 0:
+        return jsonify({'success': False, 'message': "La cantidad debe ser mayor a cero"})
+    
+    cantidad = int(cantidad)
+    
+    # Validación para cuentas corrientes
+    if forma_pago.lower() == 'cuenta corriente':
+        if not cliente or cliente == 'Consumidor Final':
+            return jsonify({'success': False, 'message': "Debe seleccionar un cliente registrado para ventas a cuenta corriente"})
+        
+        cursor.execute("SELECT id FROM clientes WHERE nombre = %s", (cliente,))
+        if not cursor.fetchone():
+            return jsonify({'success': False, 'message': "El cliente no existe en la base de datos"})
+
+    # Obtener producto
+    cursor.execute("SELECT * FROM productos WHERE id = %s FOR UPDATE", (producto_id,))
+    producto = cursor.fetchone()
+
+    if not producto:
+        return jsonify({'success': False, 'message': "Producto no encontrado."})
+    
+    if cantidad > producto['stock']:
+        return jsonify({'success': False, 'message': f"No hay stock suficiente. Stock actual: {producto['stock']}"})
+
+    # Cálculos
+    precio_venta = float(producto['precio'])
+    costo = float(producto['costo'])
+    ganancia_unitaria = precio_venta - costo
+    subtotal = precio_venta * cantidad
+    total = subtotal - descuento
+
+    if total < 0:
+        return jsonify({'success': False, 'message': "El descuento no puede ser mayor que el total."})
+
+    saldo_pendiente = total if forma_pago.lower() == 'cuenta corriente' else 0
+
+    try:
+        # Registrar venta
+        cursor.execute("""
+            INSERT INTO ventas 
+            (producto_id, cantidad, usuario, ganancia, fecha, total, 
+             forma_pago, cliente, descuento, saldo_pendiente)
+            VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (
+            producto_id, cantidad, usuario, ganancia_unitaria, 
+            total, forma_pago, cliente, descuento, saldo_pendiente
+        ))
+        venta_id = cursor.fetchone()['id']
+
+        # Actualizar stock
+        nuevo_stock = producto['stock'] - cantidad
+        cursor.execute("""
+            UPDATE productos SET stock = %s WHERE id = %s
+        """, (nuevo_stock, producto_id))
+
+        # Registrar deuda si es cuenta corriente
+        if forma_pago.lower() == 'cuenta corriente':
+            cursor.execute("""
+                INSERT INTO deudas_clientes 
+                (cliente, venta_id, monto_original, saldo_pendiente, fecha)
+                VALUES (%s, %s, %s, %s, NOW())
+                ON CONFLICT (venta_id) DO UPDATE 
+                SET saldo_pendiente = EXCLUDED.saldo_pendiente
+            """, (cliente, venta_id, total, total))
+
+        conn.commit()
+
+        # Actualizar lista de productos
+        cursor.execute("SELECT * FROM productos WHERE stock > 0")
+        productos_actualizados = cursor.fetchall()
+
+        return jsonify({
+            'success': True,
+            'message': "Venta registrada correctamente",
+            'total': f"{total:.2f}",
+            'forma_pago': forma_pago,
+            'producto': producto['nombre'],
+            'cantidad': cantidad,
+            'venta_id': venta_id,
+            'saldo_pendiente': f"{saldo_pendiente:.2f}" if saldo_pendiente > 0 else None,
+            'es_cuenta_corriente': forma_pago.lower() == 'cuenta corriente',
+            'stock_actualizado': nuevo_stock,
+            'productos': [dict(p) for p in productos_actualizados]
+        })
+
+    except psycopg2.Error as err:
+        conn.rollback()
+        return jsonify({
+            'success': False,
+            'message': f"Error al registrar la venta: {err.pgerror}"
+        })
 
     
     pass
@@ -602,6 +624,7 @@ def logout():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 
 
